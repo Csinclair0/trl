@@ -1101,13 +1101,12 @@ class GRPOTrainer(Trainer):
         attention_mask: torch.Tensor,
         **generation_kwargs,
     ) -> torch.Tensor:
-        """Generate candidates using vLLM in async mode with data parallelism."""
+        """Generate candidates using vLLM with data parallelism."""
         if not self.args.use_vllm:
             return super()._generate_candidates(input_ids, attention_mask, **generation_kwargs)
 
         # Get local process info for data parallel setup
         local_rank = self.accelerator.local_process_index
-        world_size = self.accelerator.num_processes
         
         # Connect to corresponding vLLM instance
         if not hasattr(self, "_vllm_client"):
@@ -1122,19 +1121,15 @@ class GRPOTrainer(Trainer):
         # Prepare prompts for this process
         prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
         
-        # Submit async generation requests
-        self._vllm_client.generate(
+        # Generate completions
+        outputs = self._vllm_client.generate(
             prompts=prompts,
             n=generation_kwargs.get("num_return_sequences", 1),
             temperature=generation_kwargs.get("temperature", 1.0),
             top_p=generation_kwargs.get("top_p", 1.0),
             top_k=generation_kwargs.get("top_k", -1),
             max_tokens=generation_kwargs.get("max_new_tokens", 16),
-            is_async=True
         )
-        
-        # Get results from async generation
-        outputs = self._vllm_client.get_generate_future()
         
         # Convert outputs to tensor
         generated_texts = [output for batch in outputs for output in batch]

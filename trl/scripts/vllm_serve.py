@@ -32,6 +32,7 @@ from trl.import_utils import (
 
 if is_fastapi_available():
     from fastapi import BackgroundTasks, FastAPI
+    from fastapi.responses import JSONResponse
 
 
 if is_pydantic_available():
