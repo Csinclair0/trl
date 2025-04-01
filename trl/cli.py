@@ -17,6 +17,8 @@ import sys
 
 from accelerate.commands.launch import launch_command, launch_command_parser
 
+from .scripts.benchmark_vllm_dp import main as benchmark_vllm_dp_main
+from .scripts.benchmark_vllm_dp import make_parser as make_benchmark_vllm_dp_parser
 from .scripts.chat import main as chat_main
 from .scripts.chat import make_parser as make_chat_parser
 from .scripts.dpo import make_parser as make_dpo_parser
@@ -27,6 +29,8 @@ from .scripts.sft import make_parser as make_sft_parser
 from .scripts.utils import TrlParser
 from .scripts.vllm_serve import main as vllm_serve_main
 from .scripts.vllm_serve import make_parser as make_vllm_serve_parser
+from .scripts.vllm_serve_dp import main as vllm_serve_dp_main
+from .scripts.vllm_serve_dp import make_parser as make_vllm_serve_dp_parser
 
 
 def main():
@@ -36,6 +40,7 @@ def main():
     subparsers = parser.add_subparsers(help="available commands", dest="command", parser_class=TrlParser)
 
     # Add the subparsers for every script
+    make_benchmark_vllm_dp_parser(subparsers)
     make_chat_parser(subparsers)
     make_dpo_parser(subparsers)
     subparsers.add_parser("env", help="Print the environment information")
@@ -43,15 +48,20 @@ def main():
     make_kto_parser(subparsers)
     make_sft_parser(subparsers)
     make_vllm_serve_parser(subparsers)
+    make_vllm_serve_dp_parser(subparsers)
 
     # Parse the arguments
     args = parser.parse_args()
 
-    if args.command == "chat":
+    if args.command == "benchmark-vllm-dp":
+        (script_args,) = parser.parse_args_and_config()
+        benchmark_vllm_dp_main(script_args)
+
+    elif args.command == "chat":
         (chat_args,) = parser.parse_args_and_config()
         chat_main(chat_args)
 
-    if args.command == "dpo":
+    elif args.command == "dpo":
         # Get the default args for the launch command
         dpo_training_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "dpo.py")
         args = launch_command_parser().parse_args([dpo_training_script])
@@ -93,6 +103,10 @@ def main():
     elif args.command == "vllm-serve":
         (script_args,) = parser.parse_args_and_config()
         vllm_serve_main(script_args)
+        
+    elif args.command == "vllm-serve-dp":
+        (script_args,) = parser.parse_args_and_config()
+        vllm_serve_dp_main(script_args)
 
 
 if __name__ == "__main__":
