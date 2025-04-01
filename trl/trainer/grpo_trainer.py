@@ -1101,7 +1101,7 @@ class GRPOTrainer(Trainer):
         attention_mask: torch.Tensor,
         **generation_kwargs,
     ) -> torch.Tensor:
-        """Generate candidates using vLLM with data parallelism."""
+        """Generate candidates using vLLM with RolloutEngine for data parallelism."""
         if not self.args.use_vllm:
             return super()._generate_candidates(input_ids, attention_mask, **generation_kwargs)
 
@@ -1121,7 +1121,7 @@ class GRPOTrainer(Trainer):
         # Prepare prompts for this process
         prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
         
-        # Generate completions
+        # Generate completions using RolloutEngine's async API
         outputs = self._vllm_client.generate(
             prompts=prompts,
             n=generation_kwargs.get("num_return_sequences", 1),
@@ -1129,6 +1129,7 @@ class GRPOTrainer(Trainer):
             top_p=generation_kwargs.get("top_p", 1.0),
             top_k=generation_kwargs.get("top_k", -1),
             max_tokens=generation_kwargs.get("max_new_tokens", 16),
+            rollout_mode=True  # Signal to use RolloutEngine
         )
         
         # Convert outputs to tensor

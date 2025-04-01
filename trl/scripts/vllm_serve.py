@@ -50,6 +50,8 @@ if is_vllm_available():
     from vllm.distributed.utils import StatelessProcessGroup
     from vllm.sampling_params import GuidedDecodingParams
     from vllm.worker.worker import Worker
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.rollout_engine import RolloutEngine
 else:
     Worker = object
 
@@ -184,6 +186,8 @@ class ScriptArguments:
             Maximum model sequence length.
         enable_prefix_caching (`bool` or `None`, *optional*, defaults to `None`):
             Whether to enable prefix caching in vLLM.
+        rollout_mode (`bool`, *optional*, defaults to `True`):
+            Whether to use RolloutEngine for better async data parallel support.
     """
 
     model: str = field(metadata={"help": "Model name or path to load the model from."})
@@ -254,6 +258,12 @@ class ScriptArguments:
             "hardware support this feature."
         },
     )
+    rollout_mode: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to use RolloutEngine for better async data parallel support."
+        },
+    )
 
 
 def main(script_args: ScriptArguments):
@@ -285,20 +295,22 @@ def main(script_args: ScriptArguments):
     # Calculate the data parallel rank
     dp_rank = script_args.node_rank * script_args.data_parallel_size + script_args.node_rank
 
-    llm = LLM(
+    # Initialize engine args
+    engine_args = AsyncEngineArgs(
         model=script_args.model,
-        revision=script_args.revision,
         tensor_parallel_size=script_args.tensor_parallel_size,
         data_parallel_size=script_args.data_parallel_size,
-        gpu_memory_utilization=script_args.gpu_memory_utilization,
         dtype=script_args.dtype,
-        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
-        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
-        # This is particularly useful here because we generate completions from the same prompts.
-        enable_prefix_caching=script_args.enable_prefix_caching,
+        gpu_memory_utilization=script_args.gpu_memory_utilization,
         max_model_len=script_args.max_model_len,
-        worker_cls="trl.scripts.vllm_serve.WeightSyncWorker",
+        distributed_init_method=f"tcp://{script_args.master_addr}:{script_args.master_port}" if script_args.data_parallel_size > 1 else None,
     )
+
+    # Use RolloutEngine for better async data parallel support
+    if script_args.rollout_mode:
+        engine = RolloutEngine.from_engine_args(engine_args)
+    else:
+        engine = AsyncLLMEngine.from_engine_args(engine_args)
 
     app = FastAPI()
 
@@ -324,7 +336,7 @@ def main(script_args: ScriptArguments):
         {"tensor_parallel_size": 8}
         ```
         """
-        return {"tensor_parallel_size": llm.llm_engine.parallel_config.tensor_parallel_size}
+        return {"tensor_parallel_size": engine.parallel_config.tensor_parallel_size}
 
     class GenerateRequest(BaseModel):
         prompts: list[str]
@@ -381,8 +393,18 @@ def main(script_args: ScriptArguments):
             max_tokens=request.max_tokens,
             guided_decoding=guided_decoding,
         )
-        all_outputs = llm.generate(request.prompts, sampling_params=sampling_params)
-        completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
+        
+        if isinstance(engine, RolloutEngine):
+            # RolloutEngine uses a different API for generation
+            outputs = await engine.generate_async(
+                prompts=request.prompts,
+                sampling_params=sampling_params,
+                prompt_token_ids=None  # Let the engine handle tokenization
+            )
+        else:
+            outputs = await engine.generate(request.prompts, sampling_params)
+        
+        completion_ids = [list(output.token_ids) for outputs in outputs for output in outputs.outputs]
         return {"completion_ids": completion_ids}
 
     class InitCommunicatorRequest(BaseModel):
@@ -403,7 +425,7 @@ def main(script_args: ScriptArguments):
                 - `world_size` (`int`): Total number of participating processes in the group.
         """
         background_tasks.add_task(
-            llm.collective_rpc,
+            engine.collective_rpc,
             "init_communicator",
             args=(request.host, request.port, script_args.tensor_parallel_size + 1),
         )
@@ -430,11 +452,11 @@ def main(script_args: ScriptArguments):
         """
         # The function is called this way: update_named_param(name="name", dtype=torch.float32, shape=(10, 10))
         # So with collect_rpc we need to call it this way:
-        # llm.collective_rpc("update_named_param", args=("name", torch.float32, (10, 10)))
+        # engine.collective_rpc("update_named_param", args=("name", torch.float32, (10, 10)))
         # And with background_tasks.add_task we need to call it this way:
-        # background_tasks.add_task(llm.collective_rpc, "update_named_param", args=("name", torch.float32, (10, 10)))
+        # background_tasks.add_task(engine.collective_rpc, "update_named_param", args=("name", torch.float32, (10, 10)))
         dtype = torch.__getattribute__(request.dtype.split(".")[-1])
-        background_tasks.add_task(llm.collective_rpc, "update_named_param", args=(request.name, dtype, request.shape))
+        background_tasks.add_task(engine.collective_rpc, "update_named_param", args=(request.name, dtype, request.shape))
 
         return {"message": "Request received, updating named parameter"}
 
@@ -443,7 +465,7 @@ def main(script_args: ScriptArguments):
         """
         Resets the prefix cache for the model.
         """
-        success = llm.llm_engine.reset_prefix_cache()
+        success = engine.reset_prefix_cache()
         return {"message": "Request received, resetting prefix cache status: " + str(success)}
 
     @app.post("/close_communicator/")
@@ -451,7 +473,7 @@ def main(script_args: ScriptArguments):
         """
         Closes the weight update group and cleans up associated resources.
         """
-        llm.collective_rpc("close_communicator")
+        engine.collective_rpc("close_communicator")
         return {"message": "Request received, closing communicator"}
 
     # Start the server with the port offset by the data parallel rank
