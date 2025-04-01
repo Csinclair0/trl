@@ -43,7 +43,7 @@ if is_uvicorn_available():
 
 
 if is_vllm_available():
-    from vllm import LLM, SamplingParams
+    from vllm import LLM, SamplingParams, AsyncLLMEngine, AsyncEngineArgs
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.parallel_state import get_world_group
     from vllm.distributed.utils import StatelessProcessGroup

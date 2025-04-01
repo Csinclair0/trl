@@ -1094,3 +1094,68 @@ class GRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+    def _generate_candidates(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        **generation_kwargs,
+    ) -> torch.Tensor:
+        """Generate candidates using vLLM in async mode with data parallelism."""
+        if not self.args.use_vllm:
+            return super()._generate_candidates(input_ids, attention_mask, **generation_kwargs)
+
+        # Get local process info for data parallel setup
+        local_rank = self.accelerator.local_process_index
+        world_size = self.accelerator.num_processes
+        
+        # Connect to corresponding vLLM instance
+        if not hasattr(self, "_vllm_client"):
+            base_port = self.args.vllm_server_port
+            port = base_port + local_rank
+            self._vllm_client = VLLMClient(
+                host=self.args.vllm_server_host,
+                server_port=port,
+                without_nccl=True  # Each process connects to its own vLLM instance
+            )
+
+        # Prepare prompts for this process
+        prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+        
+        # Submit async generation requests
+        self._vllm_client.generate(
+            prompts=prompts,
+            n=generation_kwargs.get("num_return_sequences", 1),
+            temperature=generation_kwargs.get("temperature", 1.0),
+            top_p=generation_kwargs.get("top_p", 1.0),
+            top_k=generation_kwargs.get("top_k", -1),
+            max_tokens=generation_kwargs.get("max_new_tokens", 16),
+            is_async=True
+        )
+        
+        # Get results from async generation
+        outputs = self._vllm_client.get_generate_future()
+        
+        # Convert outputs to tensor
+        generated_texts = [output for batch in outputs for output in batch]
+        generated_ids = self.tokenizer(
+            generated_texts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )["input_ids"].to(self.accelerator.device)
+        
+        return generated_ids
+
+    def _prepare_deepspeed(self, model: PreTrainedModel):
+        """Prepare DeepSpeed with vLLM data parallel setup."""
+        super()._prepare_deepspeed(model)
+        
+        if self.args.use_vllm:
+            # Update vLLM server with initial model weights
+            if self.is_world_process_zero():
+                self._vllm_client.update_model_params(model)
+            
+            # Ensure all processes are synchronized
+            if self.args.parallel_mode == "distributed":
+                torch.distributed.barrier()
