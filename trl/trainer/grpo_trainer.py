@@ -22,7 +22,13 @@ from typing import Any, Callable, Optional, Sized, Union
 import torch
 import torch.utils.data
 import transformers
-from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
+from accelerate.utils import (
+    broadcast_object_list,
+    gather,
+    gather_object,
+    is_peft_model,
+    set_seed,
+)
 from datasets import Dataset, IterableDataset
 from packaging import version
 from torch import nn
@@ -474,8 +480,14 @@ class GRPOTrainer(Trainer):
                 )
 
             if self.accelerator.is_main_process:
+                # Calculate the port for this process's vLLM instance
+                process_rank = self.accelerator.process_index
+                vllm_port = args.vllm_server_port + process_rank
+                
                 self.vllm_client = VLLMClient(
-                    args.vllm_server_host, args.vllm_server_port, connection_timeout=args.vllm_server_timeout
+                    args.vllm_server_host, 
+                    vllm_port,
+                    connection_timeout=args.vllm_server_timeout
                 )
 
             # vLLM specific sampling arguments
@@ -706,10 +718,14 @@ class GRPOTrainer(Trainer):
                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
                 # num_generations outputs for each one. This is faster than generating outputs for each duplicate
                 # prompt individually.
-                ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+                process_rank = self.accelerator.process_index
+                start_idx = process_rank * len(prompts_text)
+                end_idx = (process_rank + 1) * len(prompts_text)
+                process_prompts = all_prompts_text[start_idx:end_idx:self.num_generations]
+                
                 with profiling_context(self, "vLLM.generate"):
                     completion_ids = self.vllm_client.generate(
-                        prompts=ordered_set_of_prompts,
+                        prompts=process_prompts,
                         n=self.num_generations,
                         repetition_penalty=self.repetition_penalty,
                         temperature=self.temperature,
@@ -721,6 +737,7 @@ class GRPOTrainer(Trainer):
                     )
             else:
                 completion_ids = [None] * len(all_prompts_text)
+
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
             completion_ids = broadcast_object_list(completion_ids, from_process=0)

@@ -22,7 +22,12 @@ import torch
 import torch.distributed as dist
 
 from trl import TrlParser
-from trl.import_utils import is_fastapi_available, is_pydantic_available, is_uvicorn_available, is_vllm_available
+from trl.import_utils import (
+    is_fastapi_available,
+    is_pydantic_available,
+    is_uvicorn_available,
+    is_vllm_available,
+)
 
 
 if is_fastapi_available():
@@ -156,25 +161,28 @@ class ScriptArguments:
             Revision to use for the model. If not specified, the default branch will be used.
         tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Number of tensor parallel workers to use.
+        data_parallel_size (`int`, *optional*, defaults to `1`):
+            Number of data parallel workers to use.
+        node_size (`int`, *optional*, defaults to `1`):
+            Total number of nodes in the distributed setup.
+        node_rank (`int`, *optional*, defaults to `0`):
+            Rank of the current node in the distributed setup.
+        master_addr (`str`, *optional*, defaults to `"localhost"`):
+            Address of the master node for distributed training.
+        master_port (`int`, *optional*, defaults to `29500`):
+            Port number of the master node for distributed training.
         host (`str`, *optional*, defaults to `"0.0.0.0"`):
             Host address to run the server on.
         port (`int`, *optional*, defaults to `8000`):
-            Port to run the server on.
+            Base port to run the server on. Each data parallel worker will use port + rank.
         gpu_memory_utilization (`float`, *optional*, defaults to `0.9`):
-            Ratio (between 0 and 1) of GPU memory to reserve for the model weights, activations, and KV cache on the
-            device dedicated to generation powered by vLLM. Higher values will increase the KV cache size and thus
-            improve the model's throughput. However, if the value is too high, it may cause out-of-memory (OOM) errors
-            during initialization.
+            Ratio (between 0 and 1) of GPU memory to reserve for the model.
         dtype (`str`, *optional*, defaults to `"auto"`):
-            Data type to use for vLLM generation. If set to `"auto"`, the data type will be automatically determined
-            based on the model configuration. Find the supported values in the vLLM documentation.
+            Data type to use for vLLM generation.
         max_model_len (`int` or `None`, *optional*, defaults to `None`):
-            If set, the `max_model_len` to use for vLLM. This can be useful when running with reduced
-            `vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model
-            context size, which might be much larger than the KV cache, leading to inefficiencies.
+            Maximum model sequence length.
         enable_prefix_caching (`bool` or `None`, *optional*, defaults to `None`):
-            Whether to enable prefix caching in vLLM. If set to `True`, ensure that the model and the hardware support
-            this feature.
+            Whether to enable prefix caching in vLLM.
     """
 
     model: str = field(metadata={"help": "Model name or path to load the model from."})
@@ -185,6 +193,26 @@ class ScriptArguments:
     tensor_parallel_size: int = field(
         default=1,
         metadata={"help": "Number of tensor parallel workers to use."},
+    )
+    data_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Number of data parallel workers to use."},
+    )
+    node_size: int = field(
+        default=1,
+        metadata={"help": "Total number of nodes in the distributed setup."},
+    )
+    node_rank: int = field(
+        default=0,
+        metadata={"help": "Rank of the current node in the distributed setup."},
+    )
+    master_addr: str = field(
+        default="localhost",
+        metadata={"help": "Address of the master node for distributed training."},
+    )
+    master_port: int = field(
+        default=29500,
+        metadata={"help": "Port number of the master node for distributed training."},
     )
     host: str = field(
         default="0.0.0.0",
@@ -246,10 +274,21 @@ def main(script_args: ScriptArguments):
     if not is_vllm_available():
         raise ImportError("vLLM is required to run the vLLM serve script. Please install it using `pip install vllm`.")
 
+    # Set environment variables for distributed setup
+    os.environ["RANK"] = str(script_args.node_rank)
+    os.environ["WORLD_SIZE"] = str(script_args.node_size * script_args.data_parallel_size)
+    os.environ["MASTER_ADDR"] = script_args.master_addr
+    os.environ["MASTER_PORT"] = str(script_args.master_port)
+    os.environ["LOCAL_RANK"] = "0"  # Each process runs on its own GPU
+
+    # Calculate the data parallel rank
+    dp_rank = script_args.node_rank * script_args.data_parallel_size + script_args.node_rank
+
     llm = LLM(
         model=script_args.model,
         revision=script_args.revision,
         tensor_parallel_size=script_args.tensor_parallel_size,
+        data_parallel_size=script_args.data_parallel_size,
         gpu_memory_utilization=script_args.gpu_memory_utilization,
         dtype=script_args.dtype,
         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
@@ -414,8 +453,9 @@ def main(script_args: ScriptArguments):
         llm.collective_rpc("close_communicator")
         return {"message": "Request received, closing communicator"}
 
-    # Start the server
-    uvicorn.run(app, host=script_args.host, port=script_args.port)
+    # Start the server with the port offset by the data parallel rank
+    port = script_args.port + dp_rank
+    uvicorn.run(app, host=script_args.host, port=port)
 
     dist.destroy_process_group()
 
