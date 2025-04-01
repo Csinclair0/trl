@@ -293,7 +293,8 @@ def main(script_args: ScriptArguments):
     os.environ["LOCAL_RANK"] = "0"  # Each process runs on its own GPU
 
     # Calculate the data parallel rank
-    dp_rank = script_args.node_rank * script_args.data_parallel_size + script_args.node_rank
+    local_rank = int(os.environ["LOCAL_RANK"])
+    dp_rank = script_args.node_rank * script_args.data_parallel_size + local_rank
 
     # Initialize engine args
     engine_args = AsyncEngineArgs(
