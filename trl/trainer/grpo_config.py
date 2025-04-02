@@ -136,6 +136,22 @@ class GRPOConfig(TrainingArguments):
             installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`.
         num_completions_to_print (`int` or `None`, *optional*, defaults to `None`):
             Number of completions to print with `rich`. If `None`, all completions are logged.
+
+        > Parameters that control generation acceleration powered by vLLM
+
+        vllm_base_port (`int`, *optional*, defaults to `8000`):
+            Base port for the first vLLM instance in data parallel mode. Additional instances will use consecutive ports
+            (base_port+i).
+        vllm_colocation (`bool`, *optional*, defaults to `False`):
+            Whether to use colocated vLLM execution via external launcher. If set to `True`, vLLM will be initialized in
+            all processes, each assigned to its respective device. This allows multi-GPU or multi-node execution with
+            vLLM's external launcher.
+        vllm_async_mode (`bool`, *optional*, defaults to `False`):
+            Whether to use AsyncLLM for data parallelism. If True, a single AsyncLLM instance will manage data parallelism
+            internally, removing the need for separate vLLM instances.
+        vllm_async_endpoint (`str` or `None`, *optional*, defaults to `None`):
+            Socket endpoint for AsyncLLM. If None, will assume AsyncLLM is running in the same process space. Otherwise
+            should be a valid socket address like 'localhost:10000'.
     """
 
     # Parameters that control the model and reference model
@@ -376,6 +392,37 @@ class GRPOConfig(TrainingArguments):
         metadata={
             "help": "This parameter is deprecated and will be removed in version 0.18.0. To control prefix caching in "
             "vLLM, you should now use the `enable_prefix_caching` parameter in the vLLM server configuration."
+        },
+    )
+
+    # Parameters that control generation acceleration powered by vLLM
+    vllm_base_port: int = field(
+        default=8000,
+        metadata={
+            "help": "Base port for the first vLLM instance in data parallel mode. "
+            "Additional instances will use consecutive ports (base_port+i)."
+        },
+    )
+    vllm_colocation: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use colocated vLLM execution via external launcher. If set to `True`, vLLM will be "
+            "initialized in all processes, each assigned to its respective device. This allows multi-GPU "
+            "or multi-node execution with vLLM's external launcher."
+        },
+    )
+    vllm_async_mode: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use AsyncLLM for data parallelism. If True, a single AsyncLLM instance "
+            "will manage data parallelism internally, removing the need for separate vLLM instances."
+        },
+    )
+    vllm_async_endpoint: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Socket endpoint for AsyncLLM. If None, will assume AsyncLLM is running in the same "
+            "process space. Otherwise should be a valid socket address like 'localhost:10000'."
         },
     )
 

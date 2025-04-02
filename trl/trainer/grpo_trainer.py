@@ -473,10 +473,19 @@ class GRPOTrainer(Trainer):
                     "`pip install vllm` to use it."
                 )
 
+            # Initialize vllm_client to None for all processes
+            self.vllm_client = None
+            
             if self.accelerator.is_main_process:
-                self.vllm_client = VLLMClient(
-                    args.vllm_server_host, args.vllm_server_port, connection_timeout=args.vllm_server_timeout
-                )
+                if args.vllm_async_mode:
+                    # Use AsyncLLM client
+                    from ..extras.vllm_client import VLLMAsyncClient
+                    self.vllm_client = VLLMAsyncClient(endpoint=args.vllm_async_endpoint)
+                else:
+                    # Use regular vLLM client
+                    self.vllm_client = VLLMClient(
+                        args.vllm_server_host, args.vllm_server_port, connection_timeout=args.vllm_server_timeout
+                    )
 
             # vLLM specific sampling arguments
             self.guided_decoding_regex = args.vllm_guided_decoding_regex
@@ -625,6 +634,15 @@ class GRPOTrainer(Trainer):
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
         gather_if_zero3 = deepspeed.zero.GatheredParameters if zero_stage_3 else nullcontext
 
+        # Determine if we're using data parallelism for vLLM
+        is_data_parallel = self.args.vllm_parallelism_mode == "data"
+        
+        # Track version for parameters - prevents race conditions in async mode
+        if not hasattr(self, "_param_version"):
+            self._param_version = 0
+        self._param_version += 1
+        current_version = self._param_version
+
         if is_peft_model(self.model):
             # With PEFT and DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as merging
             # adapters in a sharded manner is not supported.
@@ -643,7 +661,11 @@ class GRPOTrainer(Trainer):
                     name = name.replace("modules_to_save.default.", "")
 
                     if self.accelerator.is_main_process:
-                        self.vllm_client.update_named_param(name, param.data)
+                        if self.args.vllm_async_mode:
+                            # For async mode, include version tracking
+                            self.vllm_client.update_named_param(name, param.data, version=current_version)
+                        else:
+                            self.vllm_client.update_named_param(name, param.data)
 
                 # Unmerge adapters while parameters are still gathered
                 self.model.unmerge_adapter()
@@ -653,7 +675,11 @@ class GRPOTrainer(Trainer):
             for name, param in self.model.named_parameters():
                 with gather_if_zero3([param]):
                     if self.accelerator.is_main_process:
-                        self.vllm_client.update_named_param(name, param.data)
+                        if self.args.vllm_async_mode:
+                            # For async mode, include version tracking
+                            self.vllm_client.update_named_param(name, param.data, version=current_version)
+                        else:
+                            self.vllm_client.update_named_param(name, param.data)
 
         # Reset cache on main process
         if self.accelerator.is_main_process:
@@ -677,12 +703,20 @@ class GRPOTrainer(Trainer):
             inputs = self._generate_and_score_completions(inputs)
         return inputs
 
+    @profiling_decorator
     def _generate_and_score_completions(
-        self, inputs: dict[str, Union[torch.Tensor, Any]]
+        self, inputs: Union[dict[str, Any], list]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
-        prompts = [x["prompt"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        
+        # Handle case where inputs is a list (from data parallel processing)
+        if isinstance(inputs, list):
+            prompts = [x["prompt"] for x in inputs]
+            prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        else:
+            prompts = [x["prompt"] for x in inputs]
+            prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+            
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
@@ -695,32 +729,68 @@ class GRPOTrainer(Trainer):
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
-            # First, have main process load weights if needed
-            if self.state.global_step != self._last_loaded_step:
+            # First, have main process load weights if needed, for non-data-parallel case
+            if self.args.vllm_parallelism_mode != "data" and self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
-            if self.accelerator.is_main_process:
+            
+            # For data parallel mode, all processes need the results
+            use_main_proc_only = self.args.vllm_parallelism_mode != "data"
+            
+            if self.accelerator.is_main_process or not use_main_proc_only:
                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
                 # num_generations outputs for each one. This is faster than generating outputs for each duplicate
                 # prompt individually.
                 ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
-                with profiling_context(self, "vLLM.generate"):
-                    completion_ids = self.vllm_client.generate(
-                        prompts=ordered_set_of_prompts,
-                        n=self.num_generations,
-                        repetition_penalty=self.repetition_penalty,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        top_k=-1 if self.top_k is None else self.top_k,
-                        min_p=0.0 if self.min_p is None else self.min_p,
-                        max_tokens=self.max_completion_length,
-                        guided_decoding_regex=self.guided_decoding_regex,
-                    )
+                
+                # For async mode, we can optimize by submitting multiple batches at once
+                # This allows training and generation to overlap when gradient_accumulation_steps > 1
+                if self.args.vllm_async_mode and self.args.gradient_accumulation_steps > 1:
+                    # Check if we're in training mode and not during the first gradient accumulation step
+                    if not self.control.should_evaluate and self._step % self.args.gradient_accumulation_steps > 0:
+                        # We're in a gradient accumulation step after the first one, so we can use
+                        # the completions from the first step, which are stored in self._buffered_inputs
+                        first_buffer_idx = (self._step // self.args.gradient_accumulation_steps) * self.args.gradient_accumulation_steps
+                        first_buffer_idx = first_buffer_idx % self.args.gradient_accumulation_steps
+                        buffered_inputs = self._buffered_inputs[first_buffer_idx]
+                        
+                        if buffered_inputs is not None:
+                            # Re-use existing completions from first gradient accumulation step
+                            completion_ids = buffered_inputs["completion_ids"]
+                    else:
+                        # We're in the first gradient accumulation step or evaluation mode
+                        with profiling_context(self, "vLLM.generate"):
+                            completion_ids = self._vllm_batch_inference(
+                                prompts=ordered_set_of_prompts,
+                                n=self.num_generations,
+                                repetition_penalty=self.repetition_penalty,
+                                temperature=self.temperature,
+                                top_p=self.top_p,
+                                top_k=-1 if self.top_k is None else self.top_k,
+                                min_p=0.0 if self.min_p is None else self.min_p,
+                                max_tokens=self.max_completion_length,
+                                guided_decoding_regex=self.guided_decoding_regex,
+                            )
+                else:
+                    # Standard synchronous generation
+                    with profiling_context(self, "vLLM.generate"):
+                        completion_ids = self._vllm_batch_inference(
+                            prompts=ordered_set_of_prompts,
+                            n=self.num_generations,
+                            repetition_penalty=self.repetition_penalty,
+                            temperature=self.temperature,
+                            top_p=self.top_p,
+                            top_k=-1 if self.top_k is None else self.top_k,
+                            min_p=0.0 if self.min_p is None else self.min_p,
+                            max_tokens=self.max_completion_length,
+                            guided_decoding_regex=self.guided_decoding_regex,
+                        )
             else:
                 completion_ids = [None] * len(all_prompts_text)
+            
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
@@ -734,6 +804,15 @@ class GRPOTrainer(Trainer):
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            
+            # Store completions_ids for reuse in gradient accumulation steps
+            if not self.control.should_evaluate and self.args.vllm_async_mode and self.args.gradient_accumulation_steps > 1:
+                # During first accumulation step, store the completion_ids for reuse
+                if self._step % self.args.gradient_accumulation_steps == 0:
+                    buffer_index = self._step % self.args.gradient_accumulation_steps
+                    if self._buffered_inputs[buffer_index] is None:
+                        self._buffered_inputs[buffer_index] = {}
+                    self._buffered_inputs[buffer_index]["completion_ids"] = completion_ids
         else:
             # Regular generation path
             with unwrap_model_for_generation(
@@ -1077,3 +1156,98 @@ class GRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+    def _vllm_batch_inference(self, prompts, **sampling_kwargs):
+        """Helper method to perform batch inference with vLLM client."""
+        # Initialize vLLM client if not already done
+        if self.vllm_client is None:
+            if self.args.vllm_async_mode:
+                # Initialize AsyncLLM client
+                from ..extras.vllm_client import VLLMAsyncClient
+                self.vllm_client = VLLMAsyncClient(endpoint=self.args.vllm_async_endpoint)
+            elif self.args.vllm_parallelism_mode == "data":
+                # Initialize data parallel vLLM client
+                hosts = self.args.vllm_server_hosts
+                base_port = self.args.vllm_base_port
+                data_parallel_size = self.args.vllm_data_parallel_size
+                
+                # If we have multiple hosts but not enough specified, replicate the first host
+                if len(hosts) == 1 and data_parallel_size > 1:
+                    hosts = hosts * data_parallel_size
+                    hosts = hosts[:data_parallel_size]  # Trim if needed
+                
+                self.vllm_client = VLLMDataParallelClient(
+                    hosts=hosts,
+                    ports=base_port,  # Will be incremented automatically by the client
+                    connection_timeout=self.args.vllm_server_timeout
+                )
+            elif self.args.vllm_colocation:
+                # Only initialize vLLM client on the main process when in colocation mode
+                if not self.accelerator.is_main_process:
+                    return None
+                    
+                from vllm import SamplingParams, LLM
+                from vllm.sampling_params import GuidedDecodingParams
+                
+                # Initialize LLM engine
+                self.vllm_client = LLM(
+                    model=self.args.model_name_or_path,
+                    tensor_parallel_size=self.args.tensor_parallel_size,
+                    dtype=self.args.vllm_dtype or "auto",
+                    gpu_memory_utilization=self.args.vllm_gpu_memory_utilization or 0.9,
+                    enable_prefix_caching=self.args.vllm_enable_prefix_caching or False,
+                )
+            else:
+                # Regular vLLM client using the server
+                self.vllm_client = VLLMClient(
+                    self.args.vllm_server_host,
+                    self.args.vllm_server_port,
+                    connection_timeout=self.args.vllm_server_timeout
+                )
+                
+        # Generate using appropriate client
+        if self.args.vllm_async_mode:
+            # AsyncLLM handles parallelism internally
+            outputs = self.vllm_client.generate(
+                prompts=prompts,
+                n=sampling_kwargs.pop("n", 1),
+                temperature=sampling_kwargs.pop("temperature", 1.0),
+                top_p=sampling_kwargs.pop("top_p", 1.0),
+                top_k=sampling_kwargs.pop("top_k", -1),
+                min_p=sampling_kwargs.pop("min_p", 0.0),
+                max_tokens=sampling_kwargs.pop("max_tokens", 16),
+                repetition_penalty=sampling_kwargs.pop("repetition_penalty", 1.0),
+                **sampling_kwargs
+            )
+            return outputs
+        elif self.args.vllm_parallelism_mode == "data" or not self.args.vllm_colocation:
+            # For data parallel or remote server
+            outputs = self.vllm_client.generate(prompts=prompts, **sampling_kwargs)
+        else:
+            # For colocated vLLM (direct LLM interface)
+            if self.accelerator.is_main_process:
+                # Create sampling parameters
+                guided_params = None
+                if sampling_kwargs.get("guided_decoding_regex"):
+                    guided_params = GuidedDecodingParams(
+                        guided_regex=sampling_kwargs.pop("guided_decoding_regex")
+                    )
+                    
+                sampling_params = SamplingParams(
+                    n=sampling_kwargs.get("n", 1),
+                    repetition_penalty=sampling_kwargs.get("repetition_penalty", 1.0),
+                    temperature=sampling_kwargs.get("temperature", 1.0),
+                    top_p=sampling_kwargs.get("top_p", 1.0),
+                    top_k=sampling_kwargs.get("top_k", -1),
+                    min_p=sampling_kwargs.get("min_p", 0.0),
+                    max_tokens=sampling_kwargs.get("max_tokens", 16),
+                    guided_decoding_params=guided_params,
+                )
+                
+                # Generate with LLM directly
+                outputs = self.vllm_client.generate(prompts, sampling_params=sampling_params)
+                outputs = [output.outputs[0].token_ids for output in outputs]
+            else:
+                outputs = None
+                
+        return outputs

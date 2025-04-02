@@ -15,10 +15,11 @@
 import atexit
 import logging
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from torch import nn
+import warnings
 
 from ..import_utils import is_requests_available, is_vllm_available
 
@@ -214,25 +215,33 @@ class VLLMClient:
         pg = StatelessProcessGroup.create(host=self.host, port=self.group_port, rank=self.rank, world_size=world_size)
         self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
 
-    def update_named_param(self, name: str, weights: torch.Tensor):
-        """
-        Updates a specific named parameter in the model and broadcasts it to other processes.
-
-        Args:
-            name (`str`):
-                Name of the layer whose weights are being updated.
-            weights (`torch.Tensor`):
-                Tensor containing the updated weights.
-        """
-        dtype, shape = str(weights.dtype), tuple(weights.shape)
-        url = f"http://{self.host}:{self.server_port}/update_named_param/"
-        response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
-        if response.status_code != 200:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
-
-        # Broadcast the weights to the other processes
-        self.pynccl_comm.broadcast(weights, src=self.rank, stream=torch.cuda.current_stream())
-        self.pynccl_comm.group.barrier()
+    def update_named_param(self, name: str, weight: torch.Tensor, version: Optional[int] = None):
+        """Update a named parameter in the model."""
+        # AsyncLLM doesn't currently support this operation directly
+        # This would need to be implemented when the API stabilizes
+        import warnings
+        
+        # Track version for parameter updates
+        if version is not None and not hasattr(self, "current_version"):
+            self.current_version = version
+        elif version is not None:
+            self.current_version = max(self.current_version, version)
+            
+        # Try to access internal LLM engine for parameter updates
+        if self.async_llm is not None:
+            try:
+                if hasattr(self.async_llm, "update_model_parameter"):
+                    self.async_llm.update_model_parameter(name, weight)
+                elif hasattr(self.async_llm, "_engine") and hasattr(self.async_llm._engine, "update_model_parameter"):
+                    self.async_llm._engine.update_model_parameter(name, weight)
+                else:
+                    warnings.warn("Parameter updates not yet supported with AsyncLLM. "
+                                 "Changes to model parameters won't be reflected in generation.")
+            except Exception as e:
+                warnings.warn(f"Failed to update parameter '{name}': {str(e)}")
+        else:
+            warnings.warn("Parameter updates not yet supported with AsyncLLM. "
+                         "Changes to model parameters won't be reflected in generation.")
 
     def update_model_params(self, model: nn.Module):
         """
@@ -280,3 +289,136 @@ if __name__ == "__main__":
 
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B").to("cuda")
     client.update_model_params(model)
+
+
+class VLLMAsyncClient:
+    """Client for AsyncLLM from vLLM v1 API."""
+
+    def __init__(self, async_llm: Optional[Any] = None, endpoint: Optional[str] = None):
+        """
+        Initialize the AsyncLLM client.
+        
+        Args:
+            async_llm: An instance of AsyncLLM to use directly (local mode)
+            endpoint: Socket address to connect to an AsyncLLM instance (remote mode)
+        """
+        self.async_llm = async_llm
+        self.endpoint = endpoint
+        self.current_version = 0  # Version tracking for parameter updates
+        
+        if self.async_llm is None and self.endpoint is None:
+            # Try to import AsyncLLM and find the shared instance
+            try:
+                from vllm.v1.engine import get_shared_async_llm
+                self.async_llm = get_shared_async_llm()
+                if self.async_llm is None:
+                    raise ImportError("No shared AsyncLLM instance found")
+            except (ImportError, AttributeError):
+                raise ImportError("AsyncLLM v1 API not available or no shared instance found")
+    
+    async def _generate_async(self, prompts, **kwargs):
+        """Internal method to handle async generation."""
+        if isinstance(prompts, str):
+            prompts = [prompts]
+            
+        # Configure sampling parameters
+        sampling_params = {}
+        if "n" in kwargs:
+            sampling_params["n"] = kwargs.pop("n")
+        if "temperature" in kwargs:
+            sampling_params["temperature"] = kwargs.pop("temperature")
+        if "top_p" in kwargs:
+            sampling_params["top_p"] = kwargs.pop("top_p")
+        if "top_k" in kwargs:
+            sampling_params["top_k"] = kwargs.pop("top_k")
+        if "max_tokens" in kwargs:
+            sampling_params["max_tokens"] = kwargs.pop("max_tokens")
+        if "repetition_penalty" in kwargs:
+            sampling_params["repetition_penalty"] = kwargs.pop("repetition_penalty")
+            
+        # Add any remaining kwargs
+        sampling_params.update(kwargs)
+        
+        # Call AsyncLLM directly
+        if self.async_llm is not None:
+            results = await self.async_llm.generate(prompts, sampling_params=sampling_params)
+            return results
+        
+        # TODO: Implement remote endpoint support when vLLM v1 API is more stable
+        raise NotImplementedError("Remote AsyncLLM endpoint not yet supported")
+
+    def generate(self, prompts, **kwargs):
+        """
+        Generate completions for prompts.
+        
+        Note: This is a synchronous wrapper around the async API.
+        For TRL integration, we need a synchronous interface.
+        """
+        import asyncio
+        
+        # Create and run the async event loop
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            # If no event loop exists, create a new one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        results = loop.run_until_complete(self._generate_async(prompts, **kwargs))
+        
+        # Extract token IDs from results
+        if isinstance(prompts, str):
+            # Single prompt - return a list of completions
+            return [r.outputs[0].token_ids for r in results]
+        else:
+            # Multiple prompts - return a list of lists
+            return [[o.token_ids for o in r.outputs] for r in results]
+    
+    def update_named_param(self, name: str, weight: torch.Tensor, version: Optional[int] = None):
+        """Update a named parameter in the model."""
+        import warnings
+        
+        # Track version for parameter updates
+        if version is not None:
+            self.current_version = max(self.current_version, version)
+            
+        # Try to access internal AsyncLLM engine for parameter updates
+        if self.async_llm is not None:
+            try:
+                if hasattr(self.async_llm, "update_model_parameter"):
+                    self.async_llm.update_model_parameter(name, weight)
+                elif hasattr(self.async_llm, "_engine") and hasattr(self.async_llm._engine, "update_model_parameter"):
+                    self.async_llm._engine.update_model_parameter(name, weight)
+                else:
+                    warnings.warn("Parameter updates not yet supported with this AsyncLLM")
+            except Exception as e:
+                warnings.warn(f"Failed to update parameter '{name}': {str(e)}")
+        else:
+            warnings.warn("Parameter updates not supported with remote AsyncLLM endpoint")
+    
+    def reset_prefix_cache(self):
+        """Reset the KV cache in the model."""
+        import asyncio
+        import warnings
+        
+        if self.async_llm is not None:
+            # Try to access the internal LLM engine to reset cache
+            try:
+                # Create and run the async event loop
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                async def reset_cache():
+                    if hasattr(self.async_llm, "reset_cache"):
+                        await self.async_llm.reset_cache()
+                    elif hasattr(self.async_llm, "_engine") and hasattr(self.async_llm._engine, "reset_cache"):
+                        await self.async_llm._engine.reset_cache()
+                
+                # Reset cache
+                loop.run_until_complete(reset_cache())
+            except Exception as e:
+                warnings.warn(f"Failed to reset prefix cache: {str(e)}")
+        # No action needed for remote AsyncLLM as cache is managed internally
