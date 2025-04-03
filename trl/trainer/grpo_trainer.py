@@ -455,7 +455,8 @@ class GRPOTrainer(Trainer):
 
             if self.accelerator.is_main_process:
                 self.vllm_client = VLLMClient(
-                    args.vllm_server_host, args.vllm_server_port, connection_timeout=args.vllm_server_timeout
+                    args.vllm_server_host, args.vllm_server_port, connection_timeout=args.vllm_server_timeout,
+                    enable_data_parallel=args.vllm_data_parallel
                 )
 
             # vLLM specific sampling arguments
@@ -654,19 +655,47 @@ class GRPOTrainer(Trainer):
             inputs = self._generate_and_score_completions(inputs)
         return inputs
 
+    @profiling_decorator
     def _generate_and_score_completions(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        """Return completions, advantages, both per token and total, and prompt and completion masks."""
         device = self.accelerator.device
-        prompts = [x["prompt"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        prompt_inputs = self.processing_class(
-            text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
-        )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+        prompts = inputs.pop("prompt")
+        prompts_text = inputs.pop("prompt_text")
 
-        if self.max_prompt_length is not None:
+        # Prepare prompt inputs
+        if is_conversational(prompts[0]):
+            # Create template like `<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n`.
+            # The assistant response will be generated after this template.
+            input_ids_list = []
+            attention_mask_list = []
+            for prompt in prompts:
+                if prompt[-1]["role"] == "assistant":
+                    # Remove the assistant response from the prompt to indicate the generation starts from the assistant
+                    bootstrap = prompt.pop()["content"]
+                    # Add the response back to the prompt later during reward computation
+                    prompt.append({"role": "assistant", "content": bootstrap})
+
+                # Tokenize the prompt
+                prompt_tokens = self.processing_class.apply_chat_template(
+                    prompt, tokenize=True, return_tensors="pt", padding="longest"
+                )
+                input_ids_list.append(prompt_tokens["input_ids"])
+                attention_mask_list.append(prompt_tokens["attention_mask"])
+
+            prompt_ids = torch.stack(input_ids_list, dim=0).to(device)
+            prompt_mask = torch.stack(attention_mask_list, dim=0).to(device)
+        else:
+            # Tokenize the prompt
+            prompt_tokens = self.processing_class(
+                text=prompts_text, padding=True, return_tensors="pt", add_special_tokens=False
+            )
+            prompt_ids = prompt_tokens["input_ids"].to(device)
+            prompt_mask = prompt_tokens["attention_mask"].to(device)
+
+        # Truncate prompt if needed
+        if self.max_prompt_length:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
@@ -677,13 +706,12 @@ class GRPOTrainer(Trainer):
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
-            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            all_prompts_text = gather_object(prompts_text)
-            if self.accelerator.is_main_process:
+            # Generate completions using vLLM with data parallelism if enabled
+            if self.args.vllm_data_parallel:
+                # Each rank processes its own prompts and generates completions
                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                # prompt individually.
-                ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+                # num_generations outputs for each one.
+                ordered_set_of_prompts = prompts_text[:: self.num_generations]
                 with profiling_context(self, "vLLM.generate"):
                     completion_ids = self.vllm_client.generate(
                         prompts=ordered_set_of_prompts,
@@ -696,16 +724,40 @@ class GRPOTrainer(Trainer):
                         max_tokens=self.max_completion_length,
                         guided_decoding_regex=self.guided_decoding_regex,
                     )
+                
+                # If this rank got no completions (in case of uneven distribution), use placeholder
+                if len(completion_ids) == 0:
+                    completion_ids = [[self.processing_class.pad_token_id]]
             else:
-                completion_ids = [None] * len(all_prompts_text)
-            # Broadcast the completions from the main process to all processes, ensuring each process receives its
-            # corresponding slice.
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts),
-                (self.accelerator.process_index + 1) * len(prompts),
-            )
-            completion_ids = completion_ids[process_slice]
+                # The original code path: gather all prompts and use a single call in the main process
+                all_prompts_text = gather_object(prompts_text)
+                if self.accelerator.is_main_process:
+                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                    # prompt individually.
+                    ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+                    with profiling_context(self, "vLLM.generate"):
+                        completion_ids = self.vllm_client.generate(
+                            prompts=ordered_set_of_prompts,
+                            n=self.num_generations,
+                            repetition_penalty=self.repetition_penalty,
+                            temperature=self.temperature,
+                            top_p=self.top_p,
+                            top_k=-1 if self.top_k is None else self.top_k,
+                            min_p=0.0 if self.min_p is None else self.min_p,
+                            max_tokens=self.max_completion_length,
+                            guided_decoding_regex=self.guided_decoding_regex,
+                        )
+                else:
+                    completion_ids = [None] * len(all_prompts_text)
+                # Broadcast the completions from the main process to all processes, ensuring each process receives its
+                # corresponding slice.
+                completion_ids = broadcast_object_list(completion_ids, from_process=0)
+                process_slice = slice(
+                    self.accelerator.process_index * len(prompts),
+                    (self.accelerator.process_index + 1) * len(prompts),
+                )
+                completion_ids = completion_ids[process_slice]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
@@ -761,7 +813,7 @@ class GRPOTrainer(Trainer):
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        if is_conversational(inputs[0]):
+        if is_conversational(prompts[0]):
             completions = []
             for prompt, completion in zip(prompts, completions_text):
                 bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
@@ -781,7 +833,7 @@ class GRPOTrainer(Trainer):
                 if isinstance(
                     reward_func, nn.Module
                 ):  # Module instead of PretrainedModel for compat with compiled models
-                    if is_conversational(inputs[0]):
+                    if is_conversational(prompts[0]):
                         messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                     else:
@@ -794,8 +846,8 @@ class GRPOTrainer(Trainer):
                         rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                 else:
                     # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                    keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    keys = [key for key in prompts[0] if key not in ["prompt", "completion"]]
+                    reward_kwargs = {key: [example[key] for example in prompts] for key in keys}
                     output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]

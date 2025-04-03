@@ -33,7 +33,13 @@ _import_structure = {
         "unpair_preference_dataset",
     ],
     "environment": ["TextEnvironment", "TextHistory"],
-    "extras": ["BestOfNSampler"],
+    "extras": [
+        "BestOfNSampler",
+        "setup_vllm_data_parallel_env",
+        "get_vllm_data_parallel_info",
+        "get_client_port_for_rank",
+        "get_shard_info",
+    ],
     "import_utils": [
         "is_deepspeed_available",
         "is_diffusers_available",
@@ -135,6 +141,12 @@ if TYPE_CHECKING:
     )
     from .environment import TextEnvironment, TextHistory
     from .extras import BestOfNSampler
+    from .extras import (
+        setup_vllm_data_parallel_env,
+        get_vllm_data_parallel_info,
+        get_client_port_for_rank,
+        get_shard_info,
+    )
     from .import_utils import (
         is_deepspeed_available,
         is_diffusers_available,

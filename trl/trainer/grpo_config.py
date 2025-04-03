@@ -79,10 +79,19 @@ class GRPOConfig(TrainingArguments):
         > Parameters that control generation acceleration powered by vLLM
 
         use_vllm (`bool`, *optional*, defaults to `False`):
-            Whether to use vLLM for generating completions. If set to `True`, ensure that a GPU is kept unused for
-            training, as vLLM will require one for generation. vLLM must be installed (`pip install vllm`).
-        vllm_server_host (`str`, *optional*, defaults to `"0.0.0.0"`):
-            Host of the vLLM server to connect to.
+            Whether to use vLLM for generating completions. If set to `True`, ensure that a vLLM server is
+            running. To run the server, install vLLM (`pip install vllm`) and run `trl vllm-serve`.
+        vllm_data_parallel: bool = field(
+            default=False,
+            metadata={
+                "help": "Whether to enable data parallelism for vLLM generation. If set to `True`, the prompts will be "
+                "distributed across multiple vLLM servers based on the VLLM_DP_RANK and VLLM_DP_SIZE environment variables."
+            },
+        )
+        vllm_server_host: str = field(
+            default="0.0.0.0",
+            metadata={"help": "Host of the vLLM server to connect to."},
+        )
         vllm_server_port (`int`, *optional*, defaults to `8000`):
             Port of the vLLM server to connect to.
         vllm_server_timeout (`float`, *optional*, defaults to `120.0`):
@@ -221,6 +230,13 @@ class GRPOConfig(TrainingArguments):
         metadata={
             "help": "Whether to use vLLM for generating completions. If set to `True`, ensure that a vLLM server is "
             "running. To run the server, install vLLM (`pip install vllm`) and run `trl vllm-serve`."
+        },
+    )
+    vllm_data_parallel: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to enable data parallelism for vLLM generation. If set to `True`, the prompts will be "
+            "distributed across multiple vLLM servers based on the VLLM_DP_RANK and VLLM_DP_SIZE environment variables."
         },
     )
     vllm_server_host: str = field(

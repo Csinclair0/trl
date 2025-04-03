@@ -14,8 +14,9 @@
 
 import atexit
 import logging
+import os
 import time
-from typing import Optional
+from typing import Optional, List, Union
 
 import torch
 from torch import nn
@@ -53,6 +54,9 @@ class VLLMClient:
         connection_timeout (`float`, *optional*, defaults to `0.0`):
             Total timeout duration in seconds to wait for the server to be up. If the server is not up after the
             timeout, a `ConnectionError` is raised.
+        enable_data_parallel (`bool`, *optional*, defaults to `False`):
+            Whether to enable data parallelism for generation. If True, the client will distribute prompts across
+            multiple vLLM servers based on data parallel environment variables.
 
     Examples:
         Run the vLLM server with the model `Qwen/Qwen2.5-7B`:
@@ -80,7 +84,12 @@ class VLLMClient:
     """
 
     def __init__(
-        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0
+        self, 
+        host: str = "0.0.0.0", 
+        server_port: int = 8000, 
+        group_port: int = 51216, 
+        connection_timeout: float = 0.0,
+        enable_data_parallel: bool = False
     ):
         if not is_requests_available():
             raise ImportError("requests is not installed. Please install it with `pip install requests`.")
@@ -91,6 +100,19 @@ class VLLMClient:
         self.host = host
         self.server_port = server_port
         self.group_port = group_port
+        self.enable_data_parallel = enable_data_parallel
+        
+        # Initialize data parallel attributes if enabled
+        if self.enable_data_parallel:
+            self.dp_rank = int(os.environ.get("VLLM_DP_RANK", "0"))
+            self.dp_size = int(os.environ.get("VLLM_DP_SIZE", "1"))
+            self.dp_master_ip = os.environ.get("VLLM_DP_MASTER_IP", "127.0.0.1")
+            self.dp_master_port = os.environ.get("VLLM_DP_MASTER_PORT", "51217")
+            logger.info(f"Data parallel enabled: rank={self.dp_rank}, size={self.dp_size}")
+        else:
+            self.dp_rank = 0
+            self.dp_size = 1
+        
         self.check_server(connection_timeout)  # check server and fail after timeout
         self.init_communicator()
         atexit.register(self.close_communicator)  # when the client object is deleted, close the weight update group
@@ -131,7 +153,7 @@ class VLLMClient:
 
     def generate(
         self,
-        prompts: list[str],
+        prompts: List[str],
         n: int = 1,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
@@ -140,7 +162,7 @@ class VLLMClient:
         min_p: float = 0.0,
         max_tokens: int = 16,
         guided_decoding_regex: Optional[str] = None,
-    ) -> list[list[str]]:
+    ) -> List[List[int]]:
         """
         Generates model completions for the provided prompts.
 
@@ -168,11 +190,43 @@ class VLLMClient:
             `list[list[int]]`:
                 List of lists of token IDs representing the model-generated completions for each prompt.
         """
+        # If data parallel is enabled, process only the prompts for this rank
+        if self.enable_data_parallel and len(prompts) > 0:
+            prompts_per_rank = len(prompts) // self.dp_size
+            if prompts_per_rank == 0:
+                # If we have more ranks than prompts, assign at least one prompt to each rank
+                if self.dp_rank < len(prompts):
+                    start_idx = self.dp_rank
+                    end_idx = self.dp_rank + 1
+                else:
+                    # No prompts for this rank
+                    return []
+            else:
+                start_idx = self.dp_rank * prompts_per_rank
+                end_idx = start_idx + prompts_per_rank
+                # If there are remaining prompts, distribute them among the first few ranks
+                remaining = len(prompts) % self.dp_size
+                if self.dp_rank < remaining:
+                    start_idx += self.dp_rank
+                    end_idx += self.dp_rank + 1
+                else:
+                    start_idx += remaining
+                    end_idx += remaining
+
+            # Get the slice of prompts for this rank
+            rank_prompts = prompts[start_idx:end_idx]
+            logger.info(f"DP rank {self.dp_rank} processing {len(rank_prompts)} prompts")
+            
+            if len(rank_prompts) == 0:
+                return []
+        else:
+            rank_prompts = prompts
+
         url = f"http://{self.host}:{self.server_port}/generate/"
         response = self.session.post(
             url,
             json={
-                "prompts": prompts,
+                "prompts": rank_prompts,
                 "n": n,
                 "repetition_penalty": repetition_penalty,
                 "temperature": temperature,
@@ -248,7 +302,7 @@ class VLLMClient:
 
     def reset_prefix_cache(self):
         """
-        Resets the prefix cache for the model.
+        Resets the prefix cache in the vLLM worker.
         """
         url = f"http://{self.host}:{self.server_port}/reset_prefix_cache/"
         response = self.session.post(url)
@@ -257,12 +311,20 @@ class VLLMClient:
 
     def close_communicator(self):
         """
-        Closes the weight update group and cleans up the communication group.
+        Closes the weight update group when it's no longer needed.
         """
-        url = f"http://{self.host}:{self.server_port}/close_communicator/"
-        response = self.session.post(url)
-        if response.status_code != 200:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        if hasattr(self, "pynccl_comm") and self.pynccl_comm is not None:
+            url = f"http://{self.host}:{self.server_port}/close_communicator/"
+            try:
+                response = self.session.post(url)
+                if response.status_code != 200:
+                    logger.error(f"Failed to close server-side communicator: {response.status_code}, {response.text}")
+            except Exception as e:
+                logger.error(f"Error while closing server-side communicator: {str(e)}")
+
+            # Clean up client-side resources
+            del self.pynccl_comm
+            self.pynccl_comm = None
 
 
 # Example usage

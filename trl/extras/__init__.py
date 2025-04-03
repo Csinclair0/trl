@@ -19,11 +19,31 @@ from ..import_utils import _LazyModule
 
 _import_structure = {
     "best_of_n_sampler": ["BestOfNSampler"],
+    "vllm_dp_utils": [
+        "setup_vllm_data_parallel_env",
+        "get_vllm_data_parallel_info",
+        "get_client_port_for_rank",
+        "get_shard_info",
+    ],
 }
 
 if TYPE_CHECKING:
     from .best_of_n_sampler import BestOfNSampler
+    from .vllm_dp_utils import (
+        setup_vllm_data_parallel_env,
+        get_vllm_data_parallel_info,
+        get_client_port_for_rank,
+        get_shard_info,
+    )
 else:
     import sys
 
     sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+
+__all__ = [
+    "BestOfNSampler",
+    "setup_vllm_data_parallel_env",
+    "get_vllm_data_parallel_info",
+    "get_client_port_for_rank",
+    "get_shard_info",
+]
