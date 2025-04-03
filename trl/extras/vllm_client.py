@@ -14,8 +14,9 @@
 
 import atexit
 import logging
+import os
 import time
-from typing import Optional
+from typing import Optional, List, Union, Dict, Any
 
 import torch
 from torch import nn
@@ -31,6 +32,7 @@ if is_requests_available():
 if is_vllm_available():
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.utils import get_open_port
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,18 @@ class VLLMClient:
         connection_timeout (`float`, *optional*, defaults to `0.0`):
             Total timeout duration in seconds to wait for the server to be up. If the server is not up after the
             timeout, a `ConnectionError` is raised.
+        dp_size (`int`, *optional*, defaults to `1`):
+            Data parallel size - number of model replicas to run.
+        dp_rank (`int`, *optional*, defaults to `0`):
+            Data parallel rank of this client.
+        node_size (`int`, *optional*, defaults to `1`):
+            Total number of nodes in the distributed setup.
+        node_rank (`int`, *optional*, defaults to `0`):
+            Rank of the current node.
+        master_addr (`str`, *optional*, defaults to `"127.0.0.1"`):
+            Master node IP address for data parallel communication.
+        master_port (`int`, *optional*, defaults to `0`):
+            Master node port for data parallel communication. If 0, an open port is selected.
 
     Examples:
         Run the vLLM server with the model `Qwen/Qwen2.5-7B`:
@@ -77,10 +91,28 @@ class VLLMClient:
         >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", device_map="cuda")
         >>> client.update_model_params(model)
         ```
+        
+        Run with data parallelism:
+        
+        ```python
+        >>> from trl.extras.vllm_client import VLLMClient
+        >>> client = VLLMClient(dp_size=2, dp_rank=0)
+        >>> client.generate(["Prompt for first data parallel worker"])
+        ```
     """
 
     def __init__(
-        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0
+        self, 
+        host: str = "0.0.0.0", 
+        server_port: int = 8000, 
+        group_port: int = 51216, 
+        connection_timeout: float = 0.0,
+        dp_size: int = 1,
+        dp_rank: int = 0,
+        node_size: int = 1,
+        node_rank: int = 0,
+        master_addr: str = "127.0.0.1",
+        master_port: int = 0,
     ):
         if not is_requests_available():
             raise ImportError("requests is not installed. Please install it with `pip install requests`.")
@@ -91,6 +123,29 @@ class VLLMClient:
         self.host = host
         self.server_port = server_port
         self.group_port = group_port
+        
+        # Data parallelism configuration
+        self.dp_size = dp_size
+        self.dp_rank = dp_rank
+        self.node_size = node_size
+        self.node_rank = node_rank
+        self.master_addr = master_addr
+        self.master_port = master_port if master_port > 0 else get_open_port()
+        
+        # Set environment variables for data parallelism if dp_size > 1
+        if self.dp_size > 1:
+            # Compute local dp rank within this node
+            dp_per_node = self.dp_size // self.node_size
+            self.local_dp_rank = self.dp_rank % dp_per_node
+            
+            os.environ["VLLM_DP_RANK"] = str(self.dp_rank)
+            os.environ["VLLM_DP_RANK_LOCAL"] = str(self.local_dp_rank)
+            os.environ["VLLM_DP_SIZE"] = str(self.dp_size)
+            os.environ["VLLM_DP_MASTER_IP"] = self.master_addr
+            os.environ["VLLM_DP_MASTER_PORT"] = str(self.master_port)
+            
+            logger.info(f"Initialized data parallel client with rank {self.dp_rank}/{self.dp_size}")
+        
         self.check_server(connection_timeout)  # check server and fail after timeout
         self.init_communicator()
         atexit.register(self.close_communicator)  # when the client object is deleted, close the weight update group
@@ -131,16 +186,17 @@ class VLLMClient:
 
     def generate(
         self,
-        prompts: list[str],
+        prompts: List[str],
         n: int = 1,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
         min_p: float = 0.0,
-        max_tokens: int = 16,
+        max_tokens: Union[int, List[int]] = 16,
         guided_decoding_regex: Optional[str] = None,
-    ) -> list[list[str]]:
+        **kwargs
+    ) -> List[List[int]]:
         """
         Generates model completions for the provided prompts.
 
@@ -159,30 +215,50 @@ class VLLMClient:
                 Top-k sampling parameter. `-1` means no truncation.
             min_p (`float`, *optional*, defaults to `0.0`):
                 Minimum probability for sampling.
-            max_tokens (`int`, *optional*, defaults to `16`):
+            max_tokens (`int` or `list[int]`, *optional*, defaults to `16`):
                 Maximum number of tokens to generate for each prompt.
             guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
                 Regular expression to guide the decoding process.
+            **kwargs:
+                Additional parameters to pass to the vLLM server.
 
         Returns:
             `list[list[int]]`:
                 List of lists of token IDs representing the model-generated completions for each prompt.
         """
+        # When using data parallelism, we might want to distribute prompts across ranks
+        if self.dp_size > 1 and len(prompts) > 1 and "data_parallel_distribute" in kwargs and kwargs["data_parallel_distribute"]:
+            # Distribute prompts across data parallel ranks
+            prompts_per_rank = len(prompts) // self.dp_size
+            start = self.dp_rank * prompts_per_rank
+            end = start + prompts_per_rank if self.dp_rank < self.dp_size - 1 else len(prompts)
+            original_prompts = prompts
+            prompts = prompts[start:end]
+            logger.info(f"DP rank {self.dp_rank} processing {len(prompts)}/{len(original_prompts)} prompts")
+            
+            if len(prompts) == 0:
+                # If a rank has no prompts, give it a placeholder
+                prompts = [""]
+                logger.warning(f"DP rank {self.dp_rank} has no prompts to process, using placeholder")
+        
         url = f"http://{self.host}:{self.server_port}/generate/"
-        response = self.session.post(
-            url,
-            json={
-                "prompts": prompts,
-                "n": n,
-                "repetition_penalty": repetition_penalty,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "min_p": min_p,
-                "max_tokens": max_tokens,
-                "guided_decoding_regex": guided_decoding_regex,
-            },
-        )
+        request_data = {
+            "prompts": prompts,
+            "n": n,
+            "repetition_penalty": repetition_penalty,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "max_tokens": max_tokens,
+            "guided_decoding_regex": guided_decoding_regex,
+        }
+        # Add any additional parameters
+        for key, value in kwargs.items():
+            if key != "data_parallel_distribute":
+                request_data[key] = value
+                
+        response = self.session.post(url, json=request_data)
         if response.status_code == 200:
             return response.json()["completion_ids"]
         else:
@@ -199,20 +275,61 @@ class VLLMClient:
             tensor_parallel_size = response.json()["tensor_parallel_size"]
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        
+        # In data parallel setup, each vLLM instance has its own tensor parallel group
+        # The client needs to communicate with all of them
+        if self.dp_size > 1:
+            # In data parallel mode, we need to connect to the specific DP rank's server
+            world_size = tensor_parallel_size + 1
+            self.rank = tensor_parallel_size  # The client's rank is the last process
+            
+            # Initialize weight update group for our specific DP rank
+            url = f"http://{self.host}:{self.server_port}/init_communicator/"
+            # Include DP rank information in the request
+            response = self.session.post(
+                url, 
+                json={
+                    "host": "0.0.0.0", 
+                    "port": self.group_port, 
+                    "world_size": world_size,
+                    "dp_rank": self.dp_rank,
+                }
+            )
+            if response.status_code != 200:
+                raise Exception(f"Request failed: {response.status_code}, {response.text}")
+            
+            # Set up the communication group for weight broadcasting
+            pg = StatelessProcessGroup.create(
+                host=self.host, 
+                port=self.group_port, 
+                rank=self.rank, 
+                world_size=world_size
+            )
+            self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
+            logger.info(f"Initialized communicator for DP rank {self.dp_rank}")
+        else:
+            # Original single-model behavior
+            world_size = tensor_parallel_size + 1
+            self.rank = tensor_parallel_size  # The client's rank is the last process
 
-        world_size = tensor_parallel_size + 1
-        self.rank = tensor_parallel_size  # The client's rank is the last process
+            # Initialize weight update group
+            url = f"http://{self.host}:{self.server_port}/init_communicator/"
+            # In the server side, the host is set to 0.0.0.0
+            response = self.session.post(
+                url, 
+                json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size}
+            )
+            if response.status_code != 200:
+                raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
-        # Initialize weight update group
-        url = f"http://{self.host}:{self.server_port}/init_communicator/"
-        # In the server side, the host is set to 0.0.0.0
-        response = self.session.post(url, json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size})
-        if response.status_code != 200:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
-
-        # Set up the communication group for weight broadcasting
-        pg = StatelessProcessGroup.create(host=self.host, port=self.group_port, rank=self.rank, world_size=world_size)
-        self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
+            # Set up the communication group for weight broadcasting
+            pg = StatelessProcessGroup.create(
+                host=self.host, 
+                port=self.group_port, 
+                rank=self.rank, 
+                world_size=world_size
+            )
+            self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
 
     def update_named_param(self, name: str, weights: torch.Tensor):
         """
@@ -226,7 +343,13 @@ class VLLMClient:
         """
         dtype, shape = str(weights.dtype), tuple(weights.shape)
         url = f"http://{self.host}:{self.server_port}/update_named_param/"
-        response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
+        
+        # Add DP rank info to the request if we're using data parallelism
+        request_data = {"name": name, "dtype": dtype, "shape": shape}
+        if self.dp_size > 1:
+            request_data["dp_rank"] = self.dp_rank
+            
+        response = self.session.post(url, json=request_data)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
@@ -251,7 +374,13 @@ class VLLMClient:
         Resets the prefix cache for the model.
         """
         url = f"http://{self.host}:{self.server_port}/reset_prefix_cache/"
-        response = self.session.post(url)
+        
+        # Add DP rank info to the request if we're using data parallelism
+        request_data = {}
+        if self.dp_size > 1:
+            request_data["dp_rank"] = self.dp_rank
+            
+        response = self.session.post(url, json=request_data)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
@@ -260,19 +389,23 @@ class VLLMClient:
         Closes the weight update group and cleans up the communication group.
         """
         url = f"http://{self.host}:{self.server_port}/close_communicator/"
-        response = self.session.post(url)
+        
+        # Add DP rank info to the request if we're using data parallelism
+        request_data = {}
+        if self.dp_size > 1:
+            request_data["dp_rank"] = self.dp_rank
+            
+        response = self.session.post(url, json=request_data)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
 
 # Example usage
 if __name__ == "__main__":
-    from vllm import SamplingParams
-
     client = VLLMClient()
 
     # Generate completions
-    responses = client.generate(["Hello, AI!", "Tell me a joke"], n=4, max_tokens=32, sampling_params=SamplingParams())
+    responses = client.generate(["Hello, AI!", "Tell me a joke"], n=4, max_tokens=32)
     print("Responses:", responses)  # noqa
 
     # Update model weights
