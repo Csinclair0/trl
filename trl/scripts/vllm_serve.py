@@ -241,6 +241,8 @@ class RolloutEngine():
         """ main function for llm rollout task
         """
         if not multi_round:
+            # With data parallelism, the AsyncLLMEngine will automatically
+            # distribute the prompts across the available data parallel workers
             all_outputs = await self.submit_llm_generate(prompts=prompts, sampling_params=sampling_params)
             completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
         else:
@@ -279,6 +281,12 @@ class ScriptArguments:
         enable_prefix_caching (`bool` or `None`, *optional*, defaults to `None`):
             Whether to enable prefix caching in vLLM. If set to `True`, ensure that the model and the hardware support
             this feature.
+        data_parallel_size (`int`, *optional*, defaults to `1`):
+            Number of data parallel workers to use.
+        dp_master_host (`str`, *optional*, defaults to `"localhost"`):
+            Host address for the data parallel master node.
+        dp_master_port (`int`, *optional*, defaults to `13345`):
+            Port for data parallel communication.
     """
 
     model: str = field(metadata={"help": "Model name or path to load the model from."})
@@ -328,6 +336,18 @@ class ScriptArguments:
             "help": "Whether to enable prefix caching in vLLM. If set to `True`, ensure that the model and the "
             "hardware support this feature."
         },
+    )
+    data_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Number of data parallel workers to use."},
+    )
+    dp_master_host: str = field(
+        default="localhost",
+        metadata={"help": "Host address for the data parallel master node."},
+    )
+    dp_master_port: int = field(
+        default=13345,
+        metadata={"help": "Port for data parallel communication."},
     )
 
 
@@ -380,6 +400,7 @@ def main(script_args: ScriptArguments):
             task = "auto",
             override_pooler_config = None,
             compilation_config = None,
+            data_parallel_size: int = 1,
             **kwargs,
         ) -> None:
 
@@ -416,6 +437,7 @@ def main(script_args: ScriptArguments):
                 mm_processor_kwargs=mm_processor_kwargs,
                 override_pooler_config=override_pooler_config,
                 compilation_config=compilation_config_instance,
+                data_parallel_size=data_parallel_size,
                 **kwargs,
             )
 
@@ -432,6 +454,20 @@ def main(script_args: ScriptArguments):
         def get_engine_class():
             return AsyncLLMEngine
 
+    # Set up data parallelism environment variables
+    os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
+    os.environ["VLLM_DP_MASTER_IP"] = script_args.dp_master_host
+    os.environ["VLLM_DP_MASTER_PORT"] = str(script_args.dp_master_port)
+    
+    # If running in data parallel mode, set the proper rank
+    if script_args.data_parallel_size > 1:
+        # In a distributed setup, these would come from the launcher
+        # Here we default to rank 0 if not specified externally
+        if "VLLM_DP_RANK" not in os.environ:
+            os.environ["VLLM_DP_RANK"] = "0"
+        if "VLLM_DP_RANK_LOCAL" not in os.environ:
+            os.environ["VLLM_DP_RANK_LOCAL"] = os.environ["VLLM_DP_RANK"]
+    
     llm = AsyncVllmEngine(
         model=script_args.model,
         revision=script_args.revision,
@@ -444,6 +480,7 @@ def main(script_args: ScriptArguments):
         enable_prefix_caching=script_args.enable_prefix_caching,
         max_model_len=script_args.max_model_len,
         worker_cls='trl.scripts.vllm_serve.WeightSyncWorker',
+        data_parallel_size=script_args.data_parallel_size,
     )
 
     app = FastAPI()
@@ -643,4 +680,11 @@ def make_parser(subparsers: argparse._SubParsersAction = None):
 if __name__ == "__main__":
     parser = make_parser()
     (script_args,) = parser.parse_args_and_config()
+    
+    # If using data parallelism and not already set up by an external launcher
+    if script_args.data_parallel_size > 1 and "VLLM_DP_RANK" not in os.environ:
+        print(f"Running in data parallel mode with {script_args.data_parallel_size} workers")
+        print("You should typically use torchrun or another distributed launcher to start multiple processes.")
+        print("Example: torchrun --nproc-per-node={script_args.data_parallel_size} vllm_serve.py ...")
+    
     main(script_args)
