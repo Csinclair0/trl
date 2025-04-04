@@ -706,14 +706,14 @@ class GRPOTrainer(Trainer):
             inputs = self._generate_and_score_completions(inputs)
         return inputs
 
-    def get_batch_samples(self, epoch_iterator, num_batches):
+    def get_batch_samples(self, epoch_iterator, num_batches, device_idx):
         """
         We can pre-commit batchs to vllm rollout server with after vllm goes async!
         However to do so, we just need to rewrite transformer ``get_batch_samples`` method to
         get the batch samples, record them into 'full_batch_samples'
         """
 
-        batch_samples, num_items_in_batch = super().get_batch_samples(epoch_iterator, num_batches)
+        batch_samples, num_items_in_batch = super().get_batch_samples(epoch_iterator, num_batches, device_idx)
         pre_submit = self.args.gradient_accumulation_steps != 1 and 'full_batch_samples' in all_inputs[0]
         if pre_submit:
             try:
